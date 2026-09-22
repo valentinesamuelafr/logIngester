@@ -1,0 +1,89 @@
+version: '3'
+
+dotenv: ['.env']
+
+vars:
+  VENV_DIR: .venv
+  PYTHON: "{{.VENV_DIR}}/bin/python"
+  PIP: "{{.VENV_DIR}}/bin/pip"
+
+tasks:
+  default:
+    desc: List all available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  venv:
+    desc: Create a Python venv at ./.venv and install scripts/requirements.txt into it
+    status:
+      - test -f {{.VENV_DIR}}/.installed
+    sources:
+      - scripts/requirements.txt
+    generates:
+      - "{{.VENV_DIR}}/.installed"
+    cmds:
+      - python3 -m venv {{.VENV_DIR}}
+      - "{{.PIP}} install --upgrade pip"
+      - "{{.PIP}} install -r scripts/requirements.txt"
+      - touch {{.VENV_DIR}}/.installed
+
+  shell:
+    desc: Drop into a subshell with the venv activated (run `exit` to leave it)
+    deps:
+      - venv
+    interactive: true
+    cmds:
+      - bash -c "source {{.VENV_DIR}}/bin/activate && exec ${SHELL:-bash}"
+
+  docker:start:
+    desc: Start Elasticsearch + Kibana via Docker Compose
+    cmds:
+      - docker compose up -d
+
+  es:health:
+    desc: Check Elasticsearch cluster health (uses ELASTIC_PASSWORD from .env automatically)
+    cmds:
+      - curl -s -u elastic:$ELASTIC_PASSWORD http://localhost:9200/_cluster/health?pretty
+
+  docker:stop:
+    desc: Stop containers but keep the esdata volume (data survives)
+    cmds:
+      - docker compose stop
+
+  docker:clean:
+    desc: Stop and remove containers AND the esdata volume (full reset, data is destroyed)
+    cmds:
+      - docker compose down -v
+
+  clean:
+    desc: Wipe all ingested Elasticsearch data and bring the stack back up empty, ready for a fresh reload
+    cmds:
+      - task: docker:clean
+      - task: docker:start
+
+  load:
+    desc: Ingest every file in data/ into Elasticsearch (make sure the stack is running first)
+    deps:
+      - venv
+    cmds:
+      - |
+        for f in data/*.log; do
+          [ -e "$f" ] || continue
+          echo "Ingesting $f as dataset app-container-logs"
+          {{.PYTHON}} scripts/ingest.py "$f" --dataset app-container-logs
+        done
+      - |
+        for f in data/*.json.gz; do
+          [ -e "$f" ] || continue
+          echo "Ingesting $f as dataset datadog-logs"
+          {{.PYTHON}} scripts/ingest.py "$f" --dataset datadog-logs
+        done
+      - |
+        for f in data/*; do
+          [ -e "$f" ] || continue
+          case "$f" in
+            *.log|*.json.gz) ;;
+            *) echo "Skipping $f: no dataset mapping known for this file type. Run manually: {{.PYTHON}} scripts/ingest.py \"$f\" --dataset <name>" ;;
+          esac
+        done

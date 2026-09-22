@@ -1,0 +1,25 @@
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  },
+  "mappings": {
+    "properties": {
+      "date":         { "type": "date" },
+      "service":      { "type": "keyword" },
+      "host":         { "type": "keyword" },
+      "source":       { "type": "keyword" },
+      "status":       { "type": "keyword" },
+      "message":      { "type": "text" },
+
+      "event_id":     { "type": "keyword" },
+
+      "tags_raw":     { "type": "keyword" },
+      "tags_kv":      { "type": "flattened" },
+
+      "source_file":  { "type": "keyword" },
+      "line_number":  { "type": "integer" },
+      "ingested_at":  { "type": "date" }
+    }
+  }
+}

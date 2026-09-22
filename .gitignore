@@ -1,0 +1,5 @@
+.claude
+.task
+.venv
+/data
+.env

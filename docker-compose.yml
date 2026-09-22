@@ -1,0 +1,65 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: es-local
+    environment:
+      - node.name=es-local
+      - discovery.type=single-node
+      - cluster.name=local-search
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - ES_JAVA_OPTS=-Xms2g -Xmx2g
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    mem_limit: 3g
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -u elastic:${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  # One-shot job: sets the built-in kibana_system user's password so Kibana
+  # can authenticate to Elasticsearch. Runs once per `docker compose up` and exits.
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: es-setup
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - KIBANA_SYSTEM_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
+    command: >
+      bash -c "curl -s -u elastic:$$ELASTIC_PASSWORD -X POST http://elasticsearch:9200/_security/user/kibana_system/_password -H 'Content-Type: application/json' -d '{\"password\":\"'\"$$KIBANA_SYSTEM_PASSWORD\"'\"}'"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: kibana-local
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      - SERVER_NAME=kibana-local
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
+    mem_limit: 1.5g
+    ports:
+      - "5601:5601"
+
+volumes:
+  esdata:
+    driver: local

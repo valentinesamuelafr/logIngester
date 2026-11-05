@@ -46,6 +46,14 @@ tasks:
     cmds:
       - curl -s -u elastic:$ELASTIC_PASSWORD http://localhost:9200/_cluster/health?pretty
 
+  es:clean-data:
+    desc: Delete all documents from Elasticsearch data indices (keeps mappings/settings and containers running)
+    cmds:
+      - |
+        curl -s -u elastic:$ELASTIC_PASSWORD -X POST "http://localhost:9200/*,-.*/_delete_by_query?conflicts=proceed&refresh=true&pretty" \
+          -H 'Content-Type: application/json' \
+          -d '{"query":{"match_all":{}}}'
+
   docker:stop:
     desc: Stop containers but keep the esdata volume (data survives)
     cmds:
@@ -63,27 +71,59 @@ tasks:
       - task: docker:start
 
   load:
-    desc: Ingest every file in data/ into Elasticsearch (make sure the stack is running first)
+    desc: Ingest everything under data/kuja and data/vantage into Elasticsearch (make sure the stack is running first)
+    cmds:
+      - task: load:kuja
+      - task: load:vantage
+
+  load:kuja:
+    desc: Ingest data/kuja/ (*.log as app-container-logs, *.json.gz as datadog-logs)
     deps:
       - venv
     cmds:
       - |
-        for f in data/*.log; do
+        for f in data/kuja/*.log; do
           [ -e "$f" ] || continue
           echo "Ingesting $f as dataset app-container-logs"
           {{.PYTHON}} scripts/ingest.py "$f" --dataset app-container-logs
         done
       - |
-        for f in data/*.json.gz; do
+        for f in data/kuja/*.json.gz; do
           [ -e "$f" ] || continue
           echo "Ingesting $f as dataset datadog-logs"
           {{.PYTHON}} scripts/ingest.py "$f" --dataset datadog-logs
         done
       - |
-        for f in data/*; do
+        for f in data/kuja/*; do
           [ -e "$f" ] || continue
           case "$f" in
             *.log|*.json.gz) ;;
             *) echo "Skipping $f: no dataset mapping known for this file type. Run manually: {{.PYTHON}} scripts/ingest.py \"$f\" --dataset <name>" ;;
           esac
         done
+
+  load:vantage:
+    desc: Ingest data/vantage/*.log as dataset cxc-vantage-logs (idempotent, safe to re-run)
+    deps:
+      - venv
+    cmds:
+      - |
+        for f in data/vantage/*.log; do
+          [ -e "$f" ] || continue
+          echo "Ingesting $f as dataset cxc-vantage-logs"
+          {{.PYTHON}} scripts/ingest.py "$f" --dataset cxc-vantage-logs
+        done
+      - |
+        P=$ELASTIC_PASSWORD
+        curl -s -u elastic:$P -X POST "http://localhost:9200/cxc-vantage-logs/_refresh" >/dev/null
+        echo "Docs per service (and how many carry unmapped extras in meta):"
+        curl -s -u elastic:$P "http://localhost:9200/cxc-vantage-logs/_search" -H 'Content-Type: application/json' \
+          -d '{"size":0,"aggs":{"svc":{"terms":{"field":"service","size":50},"aggs":{"with_meta":{"filter":{"exists":{"field":"meta"}}}}}}}' \
+          | {{.PYTHON}} -c "import sys,json; [print(f'  {b[\"key\"]}: {b[\"doc_count\"]} docs, {b[\"with_meta\"][\"doc_count\"]} with meta') for b in json.load(sys.stdin)['aggregations']['svc']['buckets']]"
+
+  kibana:setup:
+    desc: Create the Kibana data views and saved searches for cxc-vantage-logs (idempotent)
+    deps:
+      - venv
+    cmds:
+      - "{{.PYTHON}} scripts/kibana_setup.py"

@@ -4,6 +4,7 @@
     "number_of_replicas": 0
   },
   "mappings": {
+    "dynamic": "strict",
     "properties": {
       "timestamp":       { "type": "date" },
       "level":           { "type": "keyword" },

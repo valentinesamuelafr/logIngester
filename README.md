@@ -98,3 +98,17 @@ CSV files need none of this — they get a dynamic mapping automatically
   grows
 - Security is basic auth only, HTTP-layer TLS disabled for local
   simplicity — do not expose port 9200/5601 beyond localhost as-is
+
+## Loading log files
+
+Put files in a folder named after the application they come from:
+
+| Folder | Files | Dataset / index |
+|---|---|---|
+| `data/kuja/` | `*.log` | `app-container-logs` |
+| `data/kuja/` | `*.json.gz` | `datadog-logs` |
+| `data/vantage/` | `*.log` (pino JSON from `cxcadvantage_engagement_ms`) | `cxc-vantage-logs` (non-JSON lines go to `cxc-vantage-logs-raw`) |
+
+- `task load` loads both folders. `task load:kuja` and `task load:vantage` load one each.
+- `cxc-vantage-logs` uses `sha1(source_file:line_number)` as the document `_id`, so re-running a load overwrites instead of duplicating. The kuja datasets are not idempotent, so use `task es:clean-data` before reloading them.
+- `task kibana:setup` creates the Kibana data views and saved searches (errors, warnings, slow queries, failed outbound calls, by request id). Open Kibana at http://localhost:5601/app/discover.

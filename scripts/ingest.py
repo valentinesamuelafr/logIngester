@@ -14,6 +14,7 @@ Add a new entry there each time you bring a new schema online.
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,59 @@ ES_USER = os.environ.get("ES_USER", "elastic")
 ES_PASSWORD = os.environ.get("ES_PASSWORD")
 
 MAPPINGS_DIR = Path(__file__).parent.parent / "mappings"
+
+# app-container-logs envelope fields with a fixed mapping (see
+# mappings/kuja_logs_mapping.json). Anything else found on a log line is
+# folded into `meta` (flattened) instead of being left for Elasticsearch's
+# dynamic mapping, which would otherwise lock in whatever type it sees first
+# for that field path and then fail to parse later documents where the same
+# path holds a different type.
+APP_LOG_ENVELOPE_FIELDS = {
+    "timestamp", "level", "service", "environment", "context",
+    "trace_id", "span_id", "request_id", "request_origin",
+    "message", "meta",
+}
+
+# cxc-vantage-logs (pino JSON from any CXC Vantage microservice): source key ->
+# destination field. Everything not listed here and not already a destination
+# field is folded into `meta` (see mappings/cxc_vantage_logs_mapping.json).
+PINO_FIELD_RENAMES = {
+    "time": "timestamp",
+    "msg": "message",
+    "requestId": "request_id",
+    "origin": "request_origin",
+    "paginationMode": "pagination_mode",
+    "searchType": "search_type",
+    "filtersCount": "filters_count",
+    "joinsCount": "joins_count",
+    "complexityScore": "complexity_score",
+    "executionMs": "execution_ms",
+    "rowsReturned": "rows_returned",
+    "queryTimeoutMs": "query_timeout_ms",
+    "paramCount": "param_count",
+    "cacheHit": "cache_hit",
+    "withTotal": "with_total",
+    "poolGuardChecked": "pool_guard_checked",
+    "destinationService": "destination_service",
+    "statusCode": "status_code",
+}
+
+# destination field -> accepted python type(s). A value of the wrong type would
+# make Elasticsearch reject the whole document under the strict mapping, so it
+# is moved to `meta` instead.
+PINO_FIELD_TYPES = {
+    "timestamp": str, "level": str, "service": str, "context": str,
+    "request_id": str, "request_origin": str, "message": str, "query": str,
+    "pod": str, "container": str,
+    "entity": str, "pagination_mode": str, "search_type": str,
+    "destination_service": str, "method": str, "url": str,
+    "filters_count": int, "joins_count": int, "complexity_score": int,
+    "execution_ms": int, "rows_returned": int, "query_timeout_ms": int,
+    "param_count": int, "duration": int, "status_code": int,
+    "cache_hit": bool, "with_total": bool, "pool_guard_checked": bool,
+    "success": bool,
+    "req": dict, "err": dict,
+}
 
 # ---------------------------------------------------------------------------
 # Dataset registry: one entry per known schema. "type" controls which
@@ -57,6 +111,15 @@ DATASET_REGISTRY = {
         "index": "datadog-logs",
         "raw_index": "datadog-logs-raw",
         "mapping_file": MAPPINGS_DIR / "datadog_logs_mapping.json",
+        "raw_mapping_file": MAPPINGS_DIR / "kuja_logs_raw_mapping.json",
+    },
+    # Pino-style logs from any CXC Vantage microservice (data/vantage/):
+    # time/level/service/requestId/origin/context/msg plus sparse extras.
+    "cxc-vantage-logs": {
+        "type": "pino_json_lines",
+        "index": "cxc-vantage-logs",
+        "raw_index": "cxc-vantage-logs-raw",
+        "mapping_file": MAPPINGS_DIR / "cxc_vantage_logs_mapping.json",
         "raw_mapping_file": MAPPINGS_DIR / "kuja_logs_raw_mapping.json",
     },
     # Add more schemas here as you share them.
@@ -182,6 +245,17 @@ def process_json_lines(path: Path, index_name: str, raw_index_name: str, source_
             if "requestOrigin" in doc:
                 doc["request_origin"] = doc.pop("requestOrigin")
 
+            # Fold any field not in the fixed envelope into `meta` rather than
+            # leaving it for ES's dynamic mapping to auto-type.
+            stray_keys = [k for k in doc if k not in APP_LOG_ENVELOPE_FIELDS]
+            if stray_keys:
+                meta = doc.get("meta")
+                if not isinstance(meta, dict):
+                    meta = {} if meta is None else {"raw": meta}
+                for key in stray_keys:
+                    meta[key] = doc.pop(key)
+                doc["meta"] = meta
+
             doc["source_file"] = source_label
             doc["line_number"] = line_number
             doc["ingested_at"] = now
@@ -273,6 +347,91 @@ def process_datadog_json_lines(path: Path, index_name: str, raw_index_name: str,
             yield action
 
 
+def parse_pod_container(file_name: str):
+    """Kubernetes log file names look like <pod>_<container>.log, e.g.
+    cxcvantageengagementprod-849d947b9d-7qrl5_cxcvantageengagementprod.log.
+    Returns (pod, container), or (None, None) if the name doesn't match."""
+    stem = file_name[:-4] if file_name.endswith(".log") else file_name
+    pod, sep, container = stem.rpartition("_")
+    if not sep or not pod or not container:
+        return None, None
+    return pod, container
+
+
+def process_pino_json_lines(path: Path, index_name: str, raw_index_name: str, source_label: str):
+    """Pino-style JSON logs. Renames keys to the snake_case schema, drops nulls,
+    folds unknown or wrongly-typed values into `meta`, and uses a hash of
+    source_file + line_number as `_id` so re-ingesting a file overwrites rather
+    than duplicates. Non-JSON lines (migration banners, npm output) go to the
+    raw fallback index."""
+    now = datetime.now(timezone.utc).isoformat()
+    pod, container = parse_pod_container(source_label)
+    with open_maybe_gzip(path) as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            try:
+                doc = json.loads(line)
+            except json.JSONDecodeError:
+                doc = None
+
+            doc_id = hashlib.sha1(f"{source_label}:{line_number}".encode()).hexdigest()
+
+            if not isinstance(doc, dict):
+                yield {
+                    "_index": raw_index_name,
+                    "_id": doc_id,
+                    "_source": {
+                        "raw_line": line,
+                        "source_file": source_label,
+                        "line_number": line_number,
+                        "ingested_at": now,
+                    },
+                }
+                continue
+
+            out = {}
+            meta = {}
+            existing_meta = doc.pop("meta", None)
+            if isinstance(existing_meta, dict):
+                meta.update(existing_meta)
+            elif existing_meta is not None:
+                meta["raw"] = existing_meta
+
+            # `msg` wins over `message` when both are present.
+            if "msg" in doc and "message" in doc:
+                meta["message_alt"] = doc.pop("message")
+
+            for key, value in doc.items():
+                if value is None:
+                    continue
+                dest = PINO_FIELD_RENAMES.get(key, key)
+                expected = PINO_FIELD_TYPES.get(dest)
+                if expected is None:
+                    meta[key] = value
+                    continue
+                # bool is a subclass of int: don't let True/False land in int fields
+                ok = isinstance(value, expected) and not (expected is int and isinstance(value, bool))
+                if not ok and dest == "message":
+                    out[dest] = normalize_message(value)
+                elif ok:
+                    out[dest] = value
+                else:
+                    meta[key] = value
+
+            if meta:
+                out["meta"] = meta
+            if pod:
+                out["pod"] = pod
+                out["container"] = container
+            out["source_file"] = source_label
+            out["line_number"] = line_number
+            out["ingested_at"] = now
+
+            yield {"_index": index_name, "_id": doc_id, "_source": out}
+
+
 def process_csv(path: Path, index_name: str, source_label: str):
     now = datetime.now(timezone.utc).isoformat()
     with open(path, "rt", encoding="utf-8", errors="replace", newline="") as f:
@@ -319,6 +478,10 @@ def main():
         ensure_index(client, cfg["raw_index"], cfg["raw_mapping_file"])
         if cfg["type"] == "datadog_json_lines":
             actions = process_datadog_json_lines(
+                args.file_path, cfg["index"], cfg["raw_index"], source_label
+            )
+        elif cfg["type"] == "pino_json_lines":
+            actions = process_pino_json_lines(
                 args.file_path, cfg["index"], cfg["raw_index"], source_label
             )
         else:

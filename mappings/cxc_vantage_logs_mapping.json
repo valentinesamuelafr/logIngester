@@ -1,0 +1,51 @@
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "timestamp":          { "type": "date" },
+      "level":              { "type": "keyword" },
+      "service":            { "type": "keyword" },
+      "context":            { "type": "keyword" },
+      "pod":                { "type": "keyword" },
+      "container":          { "type": "keyword" },
+      "request_id":         { "type": "keyword" },
+      "request_origin":     { "type": "keyword" },
+
+      "message":            { "type": "text" },
+      "query":              { "type": "text" },
+
+      "entity":             { "type": "keyword" },
+      "pagination_mode":    { "type": "keyword" },
+      "search_type":        { "type": "keyword" },
+      "filters_count":      { "type": "integer" },
+      "joins_count":        { "type": "integer" },
+      "complexity_score":   { "type": "integer" },
+      "execution_ms":       { "type": "long" },
+      "rows_returned":      { "type": "long" },
+      "query_timeout_ms":   { "type": "long" },
+      "param_count":        { "type": "integer" },
+      "cache_hit":          { "type": "boolean" },
+      "with_total":         { "type": "boolean" },
+      "pool_guard_checked": { "type": "boolean" },
+
+      "destination_service":{ "type": "keyword" },
+      "method":             { "type": "keyword" },
+      "url":                { "type": "keyword", "ignore_above": 2048 },
+      "duration":           { "type": "long" },
+      "success":            { "type": "boolean" },
+      "status_code":        { "type": "integer" },
+
+      "req":                { "type": "flattened" },
+      "err":                { "type": "flattened" },
+      "meta":               { "type": "flattened" },
+
+      "source_file":        { "type": "keyword" },
+      "line_number":        { "type": "integer" },
+      "ingested_at":        { "type": "date" }
+    }
+  }
+}

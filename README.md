@@ -2,7 +2,7 @@
 
 Single-node Elasticsearch + Kibana via Docker Compose, sized for a 16GB Mac,
 with a Python ingestion script that loads `.csv`, `.json`, `.json.gz`, and
-renamed `.log` (JSON content) files.
+`.log` (JSON content) files, plus Kibana data views and saved searches.
 
 ## 1. First-time setup
 
@@ -42,24 +42,63 @@ curl -u elastic:$ELASTIC_PASSWORD http://localhost:9200/_cluster/health?pretty
 
 ## 3. Ingest files
 
+Put each file in the folder for the application it came from. `task load`
+routes by folder:
+
+| Folder | Files | Dataset / index |
+|---|---|---|
+| `data/kuja/` | `*.log` (Kuja order-service envelope) | `app-container-logs` |
+| `data/kuja/` | `*.json.gz` (Datadog archive exports) | `datadog-logs` |
+| `data/vantage/` | `*.log` (pino JSON from any CXC Vantage microservice) | `cxc-vantage-logs` |
+
 ```bash
-cd scripts
-pip install -r requirements.txt --break-system-packages   # or use a venv
-
-# Your app's own container logs (the kuja-order-service style envelope)
-python ingest.py /path/to/app.log --dataset app-container-logs
-python ingest.py /path/to/app.json.gz --dataset app-container-logs
-
-# Datadog log archive exports
-python ingest.py /path/to/archive.json.gz --dataset datadog-logs
-
-# Any CSV — index is auto-created as csv-<dataset name you choose>
-python ingest.py /path/to/orders.csv --dataset orders
+task docker:start      # stack up (first time: see sections 1-2)
+task load              # both folders
+task load:kuja         # data/kuja only
+task load:vantage      # data/vantage only (also prints docs per service)
+task kibana:setup      # Kibana data views + saved searches (idempotent)
 ```
 
-`.log` files: just make sure the content is JSON-lines (rename to `.json`
-first if you prefer, doesn't matter — the script reads by content, not
-extension, except to decide CSV vs JSON-lines vs gzip).
+`data/` is gitignored. Non-JSON lines go to `<index>-raw`.
+
+### Vantage services (`cxc-vantage-logs`)
+
+All Vantage microservices share one index. Drop each service's file flat
+into `data/vantage/`; no per-service folder or config is needed.
+
+- `service` comes from the log line itself, so use it to tell services apart.
+- `pod` and `container` are parsed from the Kubernetes file name
+  `<pod>_<container>.log` (e.g. `cxcvantageengagementprod-849d947b9d-7qrl5_cxcvantageengagementprod.log`).
+  A file name that doesn't fit the pattern just gets neither field.
+- Re-running a load is safe: the document `_id` is `sha1(source_file:line_number)`,
+  so it overwrites instead of duplicating. Two pods writing the same file name
+  would overwrite each other. The kuja datasets are not idempotent, so run
+  `task es:clean-data` before reloading them.
+- The mapping is `dynamic: strict`. Keys it doesn't know, and values of the wrong
+  type, are stored under `meta` (flattened) rather than failing the load. After
+  each `task load:vantage`, the per-service summary shows how many docs carry
+  `meta`; if a new service has a field you want to range-filter or aggregate on,
+  add it to `mappings/cxc_vantage_logs_mapping.json` and to `PINO_FIELD_TYPES` /
+  `PINO_FIELD_RENAMES` in `scripts/ingest.py`. Changing the type of an existing
+  field needs the index deleted and reloaded.
+
+### Searching in Kibana
+
+`task kibana:setup` creates data views `cxc-vantage-logs` and
+`cxc-vantage-logs-raw`, and saved searches under Discover (http://localhost:5601/app/discover):
+errors, warnings, slow queries (>20ms, tune for your data), failed outbound
+calls, by service, and by request id across services. The "by service" and
+"by request id" searches contain a `REPLACE_ME` placeholder to edit.
+
+### Manual ingest
+
+```bash
+.venv/bin/python scripts/ingest.py data/kuja/app.log --dataset app-container-logs
+.venv/bin/python scripts/ingest.py data/vantage/x.log --dataset cxc-vantage-logs
+.venv/bin/python scripts/ingest.py archive.json.gz --dataset datadog-logs
+# Any CSV: index is auto-created as csv-<dataset name you choose>
+.venv/bin/python scripts/ingest.py orders.csv --dataset orders
+```
 
 ## 4. Adding a new schema
 
@@ -70,8 +109,9 @@ extension, except to decide CSV vs JSON-lines vs gzip).
    message content
 3. If the schema needs custom normalization (like ANSI-stripping or tag
    explosion did for Datadog), add a `process_<name>_json_lines()`
-   function in `scripts/ingest.py`
-4. Register it in `DATASET_REGISTRY`
+   function in `scripts/ingest.py` (see `process_pino_json_lines` for a
+   strict-mapping example that routes unknown keys to `meta`)
+4. Register it in `DATASET_REGISTRY`, and add a folder to the `load` tasks in `Taskfile.yml`
 
 CSV files need none of this — they get a dynamic mapping automatically
 (every string column becomes `text` + `.keyword` sub-field).
@@ -88,6 +128,9 @@ CSV files need none of this — they get a dynamic mapping automatically
   document ID, so re-running the same file twice doesn't duplicate data
 - **Polymorphic `message`/`meta` fields** in app container logs are
   normalized to consistent types before indexing
+- **Vantage pino logs**: keys renamed to the snake_case schema (`time` to
+  `timestamp`, `msg` to `message`, `requestId` to `request_id`, ...), nulls dropped,
+  typed numeric/boolean fields kept queryable, `req`/`err` stored as `flattened`
 
 ## 6. Known gaps / things to revisit
 
@@ -98,17 +141,3 @@ CSV files need none of this — they get a dynamic mapping automatically
   grows
 - Security is basic auth only, HTTP-layer TLS disabled for local
   simplicity — do not expose port 9200/5601 beyond localhost as-is
-
-## Loading log files
-
-Put files in a folder named after the application they come from:
-
-| Folder | Files | Dataset / index |
-|---|---|---|
-| `data/kuja/` | `*.log` | `app-container-logs` |
-| `data/kuja/` | `*.json.gz` | `datadog-logs` |
-| `data/vantage/` | `*.log` (pino JSON from `cxcadvantage_engagement_ms`) | `cxc-vantage-logs` (non-JSON lines go to `cxc-vantage-logs-raw`) |
-
-- `task load` loads both folders. `task load:kuja` and `task load:vantage` load one each.
-- `cxc-vantage-logs` uses `sha1(source_file:line_number)` as the document `_id`, so re-running a load overwrites instead of duplicating. The kuja datasets are not idempotent, so use `task es:clean-data` before reloading them.
-- `task kibana:setup` creates the Kibana data views and saved searches (errors, warnings, slow queries, failed outbound calls, by request id). Open Kibana at http://localhost:5601/app/discover.
